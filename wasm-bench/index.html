@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>HarmonyPIR WASM Benchmark — All PRPs</title>
+  <style>
+    body { font-family: monospace; max-width: 960px; margin: 40px auto; padding: 0 20px; }
+    h1 { font-size: 1.4em; }
+    h2 { font-size: 1.1em; margin-top: 20px; }
+    table { border-collapse: collapse; width: 100%; margin: 8px 0; }
+    th, td { border: 1px solid #ccc; padding: 5px 8px; text-align: right; }
+    th { background: #f0f0f0; text-align: left; }
+    .done { color: #2a2; font-weight: bold; }
+    .running { color: #888; }
+    .error { color: #c22; }
+    button { font-family: monospace; font-size: 1em; padding: 6px 14px; cursor: pointer; margin: 3px; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #status { margin: 8px 0; padding: 8px; background: #f8f8f8; }
+    .section { margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <h1>HarmonyPIR WASM Benchmark — All PRPs</h1>
+
+  <div>
+    <button id="btn-verify" onclick="runVerify()">Verify All</button>
+    <button id="btn-per-op" onclick="runPerOp()">Per-op Bench (6M)</button>
+    <button id="btn-bucket" onclick="runBucketBench()">Single Bucket Bench</button>
+    <button id="btn-workers" onclick="runWorkerBench()">Web Worker Parallel</button>
+  </div>
+
+  <div id="status"></div>
+  <table id="results"><thead><tr>
+    <th>Benchmark</th><th>Detail</th><th>Total (ms)</th><th>Per-op (us)</th><th>Status</th>
+  </tr></thead><tbody></tbody></table>
+
+  <script type="module">
+    import init, {
+      bench_hoang_forward, bench_hoang_inverse,
+      bench_alf_forward, bench_alf_inverse,
+      bench_fastprp_forward, bench_fastprp_inverse,
+      bench_ff1_forward,
+      bench_hoang_one_bucket, bench_alf_one_bucket, bench_fastprp_one_bucket,
+      bench_hoang_n_buckets, bench_alf_n_buckets,
+      verify_hoang, verify_alf, verify_fastprp,
+    } from './pkg/harmonypir_wasm_bench.js';
+
+    const status = document.getElementById('status');
+    const tbody = document.querySelector('#results tbody');
+    const WASM_URL = './pkg/harmonypir_wasm_bench.js';
+
+    async function load() {
+      status.textContent = 'Loading WASM...';
+      try { await init(); status.innerHTML = '<span class="done">WASM loaded.</span>'; }
+      catch (e) { status.innerHTML = `<span class="error">${e}</span>`; }
+    }
+    load();
+
+    function addRow(name, detail, totalMs, perOp, st) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td style="text-align:left">${name}</td><td>${detail}</td>
+        <td>${totalMs}</td><td>${perOp}</td>
+        <td class="${st==='done'?'done':st==='running'?'running':'error'}">${st}</td>`;
+      tbody.appendChild(tr);
+      return tr;
+    }
+    function updRow(tr, totalMs, perOp, st) {
+      tr.cells[2].textContent = totalMs; tr.cells[3].textContent = perOp;
+      tr.cells[4].textContent = st; tr.cells[4].className = st==='done'?'done':'error';
+    }
+
+    // ============================================================
+    window.runVerify = function() {
+      tbody.innerHTML = '';
+      const checks = [
+        ['Hoang', () => verify_hoang(1024, 44)],
+        ['ALF',   () => verify_alf(65536)],
+        ['FastPRP', () => verify_fastprp(1024)],
+      ];
+      let ok = true;
+      for (const [n, fn] of checks) { const r = fn(); addRow(n, 'roundtrip', '-', '-', r?'done':'FAIL'); if(!r) ok=false; }
+      status.innerHTML = ok ? '<span class="done">All passed.</span>' : '<span class="error">FAIL</span>';
+    };
+
+    // ============================================================
+    window.runPerOp = async function() {
+      const btn = document.getElementById('btn-per-op');
+      btn.disabled = true; tbody.innerHTML = '';
+      status.textContent = 'Running per-op benchmarks at domain 6M...';
+      const D = 6_000_000;
+
+      const jobs = [
+        ['ALF forward',  () => bench_alf_forward(D, 5000), 5000],
+        ['ALF inverse',  () => bench_alf_inverse(D, 5000), 5000],
+        ['Hoang forward', () => bench_hoang_forward(D, 64, 500), 500],
+        ['Hoang inverse', () => bench_hoang_inverse(D, 64, 500), 500],
+        ['FastPRP forward', () => { const r = bench_fastprp_forward(D, 100); return {build:r[0],eval:r[1]}; }, 100],
+        ['FastPRP inverse', () => bench_fastprp_inverse(D, 100)[0], 100],
+        ['FF1 forward', () => bench_ff1_forward(D, 100), 100],
+      ];
+
+      for (const [name, fn, cnt] of jobs) {
+        const tr = addRow(name, `${cnt} ops @ ${(D/1e6).toFixed(0)}M`, '-', '-', 'running');
+        await new Promise(r => setTimeout(r, 5));
+        const res = fn();
+        if (typeof res === 'object' && res.build !== undefined) {
+          updRow(tr, `${res.eval.toFixed(1)} (build: ${res.build.toFixed(0)}ms)`,
+            ((res.eval*1000)/cnt).toFixed(1), 'done');
+        } else {
+          updRow(tr, res.toFixed(1), ((res*1000)/cnt).toFixed(1), 'done');
+        }
+      }
+      status.innerHTML = '<span class="done">Per-op complete.</span>';
+      btn.disabled = false;
+    };
+
+    // ============================================================
+    window.runBucketBench = async function() {
+      const btn = document.getElementById('btn-bucket');
+      btn.disabled = true; tbody.innerHTML = '';
+      status.textContent = 'Running single-bucket benchmarks...';
+
+      // INDEX: domain=2^21, T=1024
+      // CHUNK: domain=2^22, T=2048
+      const tests = [
+        ['Hoang INDEX', () => bench_hoang_one_bucket(1<<21, 64, 1024), 2048, '2^21, T=1024'],
+        ['Hoang CHUNK', () => bench_hoang_one_bucket(1<<22, 64, 2048), 4096, '2^22, T=2048'],
+        ['ALF INDEX',   () => bench_alf_one_bucket(1<<21, 1024, 0), 2048, '2^21, T=1024'],
+        ['ALF CHUNK',   () => bench_alf_one_bucket(1<<22, 2048, 0), 4096, '2^22, T=2048'],
+        ['FastPRP INDEX', () => { const r = bench_fastprp_one_bucket(1<<21, 1024); return {build:r[0],query:r[1]}; }, 2048, '2^21, T=1024'],
+        ['FastPRP CHUNK', () => { const r = bench_fastprp_one_bucket(1<<22, 2048); return {build:r[0],query:r[1]}; }, 4096, '2^22, T=2048'],
+      ];
+
+      for (const [name, fn, ops, detail] of tests) {
+        const tr = addRow(name, detail, '-', '-', 'running');
+        await new Promise(r => setTimeout(r, 5));
+        const res = fn();
+        if (typeof res === 'object' && res.build !== undefined) {
+          updRow(tr, `${res.query.toFixed(1)} (build: ${res.build.toFixed(0)}ms)`,
+            ((res.query*1000)/ops).toFixed(1), 'done');
+        } else {
+          updRow(tr, res.toFixed(1), ((res*1000)/ops).toFixed(1), 'done');
+        }
+      }
+      status.innerHTML = '<span class="done">Bucket benchmarks complete.</span>';
+      btn.disabled = false;
+    };
+
+    // ============================================================
+    // Web Worker parallel benchmark
+    // ============================================================
+    window.runWorkerBench = async function() {
+      const btn = document.getElementById('btn-workers');
+      btn.disabled = true; tbody.innerHTML = '';
+
+      const INDEX_D = 1 << 21, INDEX_T = 1024, INDEX_N = 75;
+      const CHUNK_D = 1 << 22, CHUNK_T = 2048, CHUNK_N = 80;
+      const TOTAL = INDEX_N + CHUNK_N;
+
+      // First: sequential baseline
+      status.textContent = 'Running sequential baseline (Hoang, 155 buckets)...';
+      await new Promise(r => setTimeout(r, 10));
+
+      const seqStart = performance.now();
+      const seqIdx = bench_hoang_n_buckets(INDEX_D, 64, INDEX_T, INDEX_N);
+      const seqChk = bench_hoang_n_buckets(CHUNK_D, 64, CHUNK_T, CHUNK_N);
+      const seqTotal = performance.now() - seqStart;
+      addRow('Hoang sequential', `${TOTAL} buckets`, seqTotal.toFixed(0), '-', 'done');
+
+      // Same for ALF
+      status.textContent = 'Running sequential baseline (ALF, 155 buckets)...';
+      await new Promise(r => setTimeout(r, 10));
+      const seqAlfStart = performance.now();
+      bench_alf_n_buckets(INDEX_D, INDEX_T, INDEX_N);
+      bench_alf_n_buckets(CHUNK_D, CHUNK_T, CHUNK_N);
+      const seqAlfTotal = performance.now() - seqAlfStart;
+      addRow('ALF sequential', `${TOTAL} buckets`, seqAlfTotal.toFixed(0), '-', 'done');
+
+      // Now test with workers: 1, 2, 4, 8
+      for (const prp of ['hoang', 'alf']) {
+        for (const nWorkers of [2, 4, 8]) {
+          status.textContent = `${prp} with ${nWorkers} Web Workers...`;
+          const tr = addRow(`${prp} ${nWorkers} workers`, `${TOTAL} buckets`, '-', '-', 'running');
+          await new Promise(r => setTimeout(r, 10));
+
+          try {
+            const elapsed = await runWithWorkers(prp, nWorkers, INDEX_D, CHUNK_D, INDEX_T, CHUNK_T, INDEX_N, CHUNK_N);
+            const seq = prp === 'hoang' ? seqTotal : seqAlfTotal;
+            const speedup = (seq / elapsed).toFixed(1);
+            updRow(tr, elapsed.toFixed(0), `${speedup}x speedup`, 'done');
+          } catch (e) {
+            updRow(tr, '-', '-', `error: ${e}`);
+          }
+        }
+      }
+
+      status.innerHTML = '<span class="done">Worker benchmarks complete.</span>';
+      btn.disabled = false;
+    };
+
+    function runWithWorkers(prp, nWorkers, idxD, chkD, idxT, chkT, idxN, chkN) {
+      return new Promise((resolve, reject) => {
+        // Build work items: each is {domain, rounds, t}
+        const work = [];
+        for (let i = 0; i < idxN; i++) work.push({ domain: idxD, t: idxT });
+        for (let i = 0; i < chkN; i++) work.push({ domain: chkD, t: chkT });
+
+        // Partition work across workers
+        const perWorker = Math.ceil(work.length / nWorkers);
+        const workers = [];
+        let doneCount = 0;
+        const wallStart = performance.now();
+
+        for (let w = 0; w < nWorkers; w++) {
+          const start = w * perWorker;
+          const slice = work.slice(start, start + perWorker);
+          if (slice.length === 0) continue;
+
+          // Count INDEX vs CHUNK buckets in this slice
+          const idxCount = slice.filter(x => x.domain === idxD).length;
+          const chkCount = slice.filter(x => x.domain === chkD).length;
+
+          const worker = new Worker('./worker.js', { type: 'module' });
+          workers.push(worker);
+
+          worker.onmessage = function(e) {
+            if (e.data.type === 'ready') {
+              // Send work: run INDEX buckets then CHUNK buckets
+              // Worker runs them sequentially internally
+              worker.postMessage({
+                type: 'run',
+                payload: { prp, domain: idxD, rounds: 64, t: idxT, bucketStart: 0, bucketCount: idxCount }
+              });
+              // Queue chunk work after index
+              worker._chkCount = chkCount;
+              worker._phase = 'index';
+            } else if (e.data.type === 'done') {
+              if (worker._phase === 'index' && worker._chkCount > 0) {
+                worker._phase = 'chunk';
+                worker.postMessage({
+                  type: 'run',
+                  payload: { prp, domain: chkD, rounds: 64, t: chkT, bucketStart: 0, bucketCount: worker._chkCount }
+                });
+              } else {
+                worker.terminate();
+                doneCount++;
+                if (doneCount === workers.length) {
+                  resolve(performance.now() - wallStart);
+                }
+              }
+            } else if (e.data.type === 'error') {
+              worker.terminate();
+              reject(e.data.error);
+            }
+          };
+
+          // Use absolute URL for the WASM module
+          const absUrl = new URL('./pkg/harmonypir_wasm_bench.js', window.location.href).href;
+          worker.postMessage({ type: 'init', payload: { wasmUrl: absUrl } });
+        }
+      });
+    }
+  </script>
+</body>
+</html>

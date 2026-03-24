@@ -1,0 +1,37 @@
+[package]
+name = "harmonypir"
+version = "0.1.0"
+edition = "2021"
+description = "Independent implementation of HarmonyPIR: Efficient Single-Server Stateful PIR"
+
+[features]
+default = ["alf", "fastprp-prp"]
+alf = ["dep:alf-nt", "dep:rayon"]
+fastprp-prp = ["dep:fastprp", "dep:serde", "dep:bincode"]
+
+[dependencies]
+aes = "0.8"
+cipher = "0.4"
+fpe = "0.6"
+rand = "0.8"
+rand_chacha = "0.3"
+num-bigint = "0.4"
+rayon = { version = "1.10", optional = true }
+
+# Optional PRP backends
+fastprp = { path = "../fastprp", optional = true }
+alf-nt = { path = "../ALF", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+bincode = { version = "1", optional = true }
+
+# WASM support: getrandom needs "js" feature for browser environments
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rayon = "1.10"
+
+[[bench]]
+name = "pir_bench"
+harness = false
