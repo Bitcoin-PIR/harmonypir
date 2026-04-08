@@ -117,7 +117,7 @@ impl Params {
 
 /// Find a divisor of `n` close to `target`.
 /// Searches outward from `target` in both directions.
-fn find_nearby_divisor(n: usize, target: usize) -> usize {
+pub fn find_nearby_divisor(n: usize, target: usize) -> usize {
     if target == 0 {
         return 1;
     }

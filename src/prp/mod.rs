@@ -41,6 +41,18 @@ pub trait Prp {
 
     /// The domain size N'. Valid inputs are 0..N'-1.
     fn domain(&self) -> usize;
+
+    /// Evaluate forward on 4 inputs simultaneously (AES-NI pipelining).
+    /// Default: sequential. Override for backends with 4-way support.
+    fn forward_4(&self, xs: [usize; 4]) -> [usize; 4] {
+        [self.forward(xs[0]), self.forward(xs[1]), self.forward(xs[2]), self.forward(xs[3])]
+    }
+
+    /// Evaluate inverse on 4 inputs simultaneously (AES-NI pipelining).
+    /// Default: sequential. Override for backends with 4-way support.
+    fn inverse_4(&self, ys: [usize; 4]) -> [usize; 4] {
+        [self.inverse(ys[0]), self.inverse(ys[1]), self.inverse(ys[2]), self.inverse(ys[3])]
+    }
 }
 
 /// Extended PRP trait for batch full-domain permutation table generation.

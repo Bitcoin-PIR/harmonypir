@@ -249,6 +249,84 @@ impl RelocationDS {
     pub fn is_cell_in_relocated_segment(&self, c: usize) -> bool {
         self.hist.is_cell_relocated(c)
     }
+
+    /// Batch Access: return the value in each cell, using round-based 4-way PRP.
+    ///
+    /// Round 1: batch `inverse_4` on all cells.
+    /// Most cells resolve immediately (inv < N').
+    /// Cells needing chain-walk are collected for subsequent rounds.
+    pub fn batch_access(&self, cells: &[usize]) -> Result<Vec<usize>> {
+        let n = cells.len();
+        let mut results = vec![EMPTY; n];
+        // Pending chain-walks: (result_index, current_cell)
+        let mut pending: Vec<(usize, usize)> = Vec::with_capacity(n);
+
+        // ── Round 1: batch inverse on all input cells ──
+        let mut i = 0;
+        while i + 4 <= n {
+            let invs = self.prp.inverse_4([cells[i], cells[i+1], cells[i+2], cells[i+3]]);
+            for k in 0..4 {
+                self.classify_access(cells[i+k], invs[k], i+k, &mut results, &mut pending);
+            }
+            i += 4;
+        }
+        // Remainder (< 4 elements)
+        for k in i..n {
+            let inv = self.prp.inverse(cells[k]);
+            self.classify_access(cells[k], inv, k, &mut results, &mut pending);
+        }
+
+        // ── Subsequent rounds: resolve chain-walks in batches ──
+        let max_rounds = self.n_prime + 1;
+        for _ in 0..max_rounds {
+            if pending.is_empty() { break; }
+            let mut next: Vec<(usize, usize)> = Vec::with_capacity(pending.len());
+
+            let mut j = 0;
+            while j + 4 <= pending.len() {
+                let invs = self.prp.inverse_4([
+                    pending[j].1, pending[j+1].1, pending[j+2].1, pending[j+3].1,
+                ]);
+                for k in 0..4 {
+                    self.classify_access(pending[j+k].1, invs[k], pending[j+k].0, &mut results, &mut next);
+                }
+                j += 4;
+            }
+            for k in j..pending.len() {
+                let inv = self.prp.inverse(pending[k].1);
+                self.classify_access(pending[k].1, inv, pending[k].0, &mut results, &mut next);
+            }
+
+            pending = next;
+        }
+
+        Ok(results)
+    }
+
+    /// Classify an inverse result: real value, empty, or needs chain-walk.
+    #[inline(always)]
+    fn classify_access(
+        &self,
+        cell: usize,
+        inv: usize,
+        result_idx: usize,
+        results: &mut [usize],
+        pending: &mut Vec<(usize, usize)>,
+    ) {
+        if inv < self.n_prime {
+            results[result_idx] = inv;
+        } else {
+            let empty_idx = inv - self.n_prime;
+            match self.hist.index_lookup(empty_idx) {
+                Some(source_cell) if source_cell != cell => {
+                    pending.push((result_idx, source_cell));
+                }
+                _ => {
+                    // EMPTY — stays as initialized.
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

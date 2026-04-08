@@ -99,75 +99,158 @@ impl HoangPrp {
     /// `forward = false` means phases in reverse, rounds within each phase in reverse.
     fn shuffle(&self, mut x: usize, forward: bool) -> usize {
         let num_phases = self.r / BETA;
+        let ds = self.domain_size;
 
-        let phase_iter: Box<dyn Iterator<Item = usize>> = if forward {
-            Box::new(0..num_phases)
-        } else {
-            Box::new((0..num_phases).rev())
-        };
-
-        for phase_idx in phase_iter {
-            let round_base = phase_idx * BETA;
-
-            // Collect the β round keys for this phase.
-            let phase_keys: [usize; BETA] = [
-                self.round_keys[round_base],
-                self.round_keys[round_base + 1],
-                self.round_keys[round_base + 2],
-                self.round_keys[round_base + 3],
-            ];
-
-            // Compute the phase group G (2^β = 16 positions reachable from X).
-            // G[mask] = X ⊕ XOR of keys selected by the bitmask.
-            let mut group = [0usize; 1 << BETA];
-            for mask in 0..(1u32 << BETA) {
-                let mut val = x;
-                for bit in 0..BETA {
-                    if mask & (1 << bit) != 0 {
-                        val ^= phase_keys[bit];
-                    }
-                }
-                group[mask as usize] = val;
+        // Avoid Box<dyn Iterator> per call — unroll the direction logic.
+        if forward {
+            for phase_idx in 0..num_phases {
+                x = self.apply_phase(x, phase_idx, ds, true);
             }
-
-            // Sort G to get a canonical ordering.
-            let mut sorted_group = group;
-            sorted_group.sort_unstable();
-
-            // Single AES call for this phase's round functions.
-            // f = AES_k("function" || phase_idx || G_sorted[0])
-            let func_plaintext = round_func_plaintext(phase_idx, sorted_group[0]);
-            let mut func_block = Block::from(func_plaintext);
-            self.cipher.encrypt_block(&mut func_block);
-            let f_bits = u128::from_le_bytes(func_block.into());
-
-            // Apply each round within the phase.
-            let round_iter: Box<dyn Iterator<Item = usize>> = if forward {
-                Box::new(0..BETA)
-            } else {
-                Box::new((0..BETA).rev())
-            };
-
-            for j in round_iter {
-                let x_prime = x ^ phase_keys[j];
-                let x_min = x.min(x_prime);
-
-                // rank(x_min, sorted_group): find x_min's position in the sorted group.
-                let p = sorted_group
-                    .iter()
-                    .position(|&v| v == x_min)
-                    .expect("x_min must be in the phase group");
-
-                // The round function bit is at position (p * BETA + j) in f_bits.
-                let bit_index = p * BETA + j;
-                let should_swap = (f_bits >> bit_index) & 1 == 1;
-
-                if should_swap {
-                    x = x_prime;
-                }
+        } else {
+            for phase_idx in (0..num_phases).rev() {
+                x = self.apply_phase(x, phase_idx, ds, false);
             }
         }
+        x
+    }
 
+    /// Apply a single phase (β=4 rounds) to position x.
+    #[inline]
+    fn apply_phase(&self, mut x: usize, phase_idx: usize, ds: usize, forward: bool) -> usize {
+        let round_base = phase_idx * BETA;
+        let pk = [
+            self.round_keys[round_base],
+            self.round_keys[round_base + 1],
+            self.round_keys[round_base + 2],
+            self.round_keys[round_base + 3],
+        ];
+
+        // Phase group: 16 positions reachable from x via subsets of round keys.
+        let mut sorted = [0usize; 16];
+        // Unrolled: XOR combinations of 4 keys → 16 values.
+        sorted[0]  = x;
+        sorted[1]  = x ^ pk[0];
+        sorted[2]  = x ^ pk[1];
+        sorted[3]  = x ^ pk[0] ^ pk[1];
+        sorted[4]  = x ^ pk[2];
+        sorted[5]  = x ^ pk[0] ^ pk[2];
+        sorted[6]  = x ^ pk[1] ^ pk[2];
+        sorted[7]  = x ^ pk[0] ^ pk[1] ^ pk[2];
+        sorted[8]  = x ^ pk[3];
+        sorted[9]  = x ^ pk[0] ^ pk[3];
+        sorted[10] = x ^ pk[1] ^ pk[3];
+        sorted[11] = x ^ pk[0] ^ pk[1] ^ pk[3];
+        sorted[12] = x ^ pk[2] ^ pk[3];
+        sorted[13] = x ^ pk[0] ^ pk[2] ^ pk[3];
+        sorted[14] = x ^ pk[1] ^ pk[2] ^ pk[3];
+        sorted[15] = x ^ pk[0] ^ pk[1] ^ pk[2] ^ pk[3];
+        sorted.sort_unstable();
+
+        // One AES call per phase.
+        let mut blk = Block::from(round_func_plaintext(phase_idx, sorted[0]));
+        self.cipher.encrypt_block(&mut blk);
+        let f: u128 = u128::from_le_bytes(blk.into());
+
+        if forward {
+            for j in 0..BETA {
+                x = self.apply_round(x, pk[j], ds, &sorted, f, j);
+            }
+        } else {
+            for j in (0..BETA).rev() {
+                x = self.apply_round(x, pk[j], ds, &sorted, f, j);
+            }
+        }
+        x
+    }
+
+    /// Apply a single round within a phase.
+    #[inline(always)]
+    fn apply_round(&self, x: usize, rk: usize, ds: usize, sorted: &[usize; 16], f: u128, j: usize) -> usize {
+        let xp = x ^ rk;
+        if xp >= ds { return x; }
+        let xmin = x.min(xp);
+        // Binary search on 16-element sorted array (4 comparisons vs ~8 for linear).
+        let p = sorted.binary_search(&xmin).unwrap();
+        if (f >> (p * BETA + j)) & 1 == 1 { xp } else { x }
+    }
+
+    /// Apply one phase to 4 elements simultaneously with AES-NI pipelining.
+    #[inline]
+    fn apply_phase_4way(&self, x: &mut [usize; 4], phase_idx: usize, forward: bool) {
+        let ds = self.domain_size;
+        let round_base = phase_idx * BETA;
+        let pk = [
+            self.round_keys[round_base],
+            self.round_keys[round_base + 1],
+            self.round_keys[round_base + 2],
+            self.round_keys[round_base + 3],
+        ];
+
+        // Compute + sort phase groups for all 4 elements.
+        let mut sorted = [[0usize; 16]; 4];
+        for e in 0..4 {
+            let xe = x[e];
+            sorted[e][0]  = xe;
+            sorted[e][1]  = xe ^ pk[0];
+            sorted[e][2]  = xe ^ pk[1];
+            sorted[e][3]  = xe ^ pk[0] ^ pk[1];
+            sorted[e][4]  = xe ^ pk[2];
+            sorted[e][5]  = xe ^ pk[0] ^ pk[2];
+            sorted[e][6]  = xe ^ pk[1] ^ pk[2];
+            sorted[e][7]  = xe ^ pk[0] ^ pk[1] ^ pk[2];
+            sorted[e][8]  = xe ^ pk[3];
+            sorted[e][9]  = xe ^ pk[0] ^ pk[3];
+            sorted[e][10] = xe ^ pk[1] ^ pk[3];
+            sorted[e][11] = xe ^ pk[0] ^ pk[1] ^ pk[3];
+            sorted[e][12] = xe ^ pk[2] ^ pk[3];
+            sorted[e][13] = xe ^ pk[0] ^ pk[2] ^ pk[3];
+            sorted[e][14] = xe ^ pk[1] ^ pk[2] ^ pk[3];
+            sorted[e][15] = xe ^ pk[0] ^ pk[1] ^ pk[2] ^ pk[3];
+            sorted[e].sort_unstable();
+        }
+
+        // 4-way AES encrypt — pipelined through AES-NI.
+        let mut blocks: [Block; 4] = [
+            Block::from(round_func_plaintext(phase_idx, sorted[0][0])),
+            Block::from(round_func_plaintext(phase_idx, sorted[1][0])),
+            Block::from(round_func_plaintext(phase_idx, sorted[2][0])),
+            Block::from(round_func_plaintext(phase_idx, sorted[3][0])),
+        ];
+        self.cipher.encrypt_blocks(&mut blocks);
+
+        let f = [
+            u128::from_le_bytes(blocks[0].into()),
+            u128::from_le_bytes(blocks[1].into()),
+            u128::from_le_bytes(blocks[2].into()),
+            u128::from_le_bytes(blocks[3].into()),
+        ];
+
+        if forward {
+            for j in 0..BETA {
+                for e in 0..4 { x[e] = self.apply_round(x[e], pk[j], ds, &sorted[e], f[e], j); }
+            }
+        } else {
+            for j in (0..BETA).rev() {
+                for e in 0..4 { x[e] = self.apply_round(x[e], pk[j], ds, &sorted[e], f[e], j); }
+            }
+        }
+    }
+
+    /// Shuffle 4 elements forward simultaneously with AES-NI pipelining.
+    fn shuffle_forward_4way(&self, mut x: [usize; 4]) -> [usize; 4] {
+        let num_phases = self.r / BETA;
+        for phase_idx in 0..num_phases {
+            self.apply_phase_4way(&mut x, phase_idx, true);
+        }
+        x
+    }
+
+    /// Shuffle 4 elements inverse simultaneously with AES-NI pipelining.
+    fn shuffle_inverse_4way(&self, mut x: [usize; 4]) -> [usize; 4] {
+        let num_phases = self.r / BETA;
+        for phase_idx in (0..num_phases).rev() {
+            self.apply_phase_4way(&mut x, phase_idx, false);
+        }
         x
     }
 }
@@ -180,13 +263,19 @@ impl Prp for HoangPrp {
 
     fn inverse(&self, y: usize) -> usize {
         assert!(y < self.domain_size, "input {y} >= domain {}", self.domain_size);
-        // The swap-or-not structure is self-inverse per round:
-        // to invert, just reverse the order of rounds (and phases).
         self.shuffle(y, false)
     }
 
     fn domain(&self) -> usize {
         self.domain_size
+    }
+
+    fn forward_4(&self, xs: [usize; 4]) -> [usize; 4] {
+        self.shuffle_forward_4way(xs)
+    }
+
+    fn inverse_4(&self, ys: [usize; 4]) -> [usize; 4] {
+        self.shuffle_inverse_4way(ys)
     }
 }
 
@@ -194,19 +283,51 @@ impl Prp for HoangPrp {
 impl super::BatchPrp for HoangPrp {
     fn batch_forward(&self) -> Vec<usize> {
         use rayon::prelude::*;
-        (0..self.domain_size)
-            .into_par_iter()
-            .map(|x| self.shuffle(x, true))
-            .collect()
+        let n = self.domain_size;
+        let mut result = vec![0usize; n];
+        // Process in chunks of 4 for AES-NI pipelining, parallelized across cores.
+        result
+            .par_chunks_mut(4)
+            .enumerate()
+            .for_each(|(ci, out)| {
+                let base = ci * 4;
+                // Clamp to valid domain for the last (possibly partial) chunk.
+                let xs = [
+                    base,
+                    (base + 1).min(n - 1),
+                    (base + 2).min(n - 1),
+                    (base + 3).min(n - 1),
+                ];
+                let ys = self.shuffle_forward_4way(xs);
+                for (o, &y) in out.iter_mut().zip(ys.iter()) {
+                    *o = y;
+                }
+            });
+        result
     }
 }
 
 #[cfg(not(feature = "alf"))]
 impl super::BatchPrp for HoangPrp {
     fn batch_forward(&self) -> Vec<usize> {
-        (0..self.domain_size)
-            .map(|x| self.shuffle(x, true))
-            .collect()
+        let n = self.domain_size;
+        let mut result = vec![0usize; n];
+        // Process in chunks of 4 for AES-NI pipelining (single-threaded fallback).
+        for ci in 0..(n + 3) / 4 {
+            let base = ci * 4;
+            let xs = [
+                base,
+                (base + 1).min(n - 1),
+                (base + 2).min(n - 1),
+                (base + 3).min(n - 1),
+            ];
+            let ys = self.shuffle_forward_4way(xs);
+            let end = (base + 4).min(n);
+            for (i, &y) in (base..end).zip(ys.iter()) {
+                result[i] = y;
+            }
+        }
+        result
     }
 }
 
@@ -262,6 +383,48 @@ mod tests {
     }
 
     #[test]
+    fn test_non_power_of_two_domain() {
+        let key = [0x42u8; 16];
+        let domain = 100; // Not a power of 2
+        let r = 44;
+        let prp = HoangPrp::new(domain, r, &key);
+
+        // forward must stay in range
+        for x in 0..domain {
+            let y = prp.forward(x);
+            assert!(y < domain, "forward({x}) = {y} out of range (domain={domain})");
+        }
+
+        // must be a permutation
+        let mut outputs: Vec<usize> = (0..domain).map(|x| prp.forward(x)).collect();
+        outputs.sort();
+        assert_eq!(outputs, (0..domain).collect::<Vec<_>>(), "not a permutation");
+
+        // inverse must round-trip
+        for x in 0..domain {
+            let y = prp.forward(x);
+            let x_back = prp.inverse(y);
+            assert_eq!(x_back, x, "inverse(forward({x})) = {x_back} != {x}");
+        }
+    }
+
+    #[test]
+    fn test_large_non_power_of_two() {
+        let key = [0xAB; 16];
+        let domain = 754245; // Real index bucket size
+        let r = 64;
+        let prp = HoangPrp::new(domain, r, &key);
+
+        // Spot-check a handful of values stay in range and round-trip.
+        for x in [0, 1, 2, 100, domain / 2, domain - 1] {
+            let y = prp.forward(x);
+            assert!(y < domain, "forward({x}) = {y} >= {domain}");
+            let x_back = prp.inverse(y);
+            assert_eq!(x_back, x, "round-trip failed for x={x}");
+        }
+    }
+
+    #[test]
     fn test_different_keys_different_permutations() {
         let domain = 16;
         let r = 44;
@@ -271,5 +434,63 @@ mod tests {
         let out1: Vec<usize> = (0..domain).map(|x| prp1.forward(x)).collect();
         let out2: Vec<usize> = (0..domain).map(|x| prp2.forward(x)).collect();
         assert_ne!(out1, out2, "different keys should give different permutations");
+    }
+
+    #[test]
+    fn test_4way_matches_sequential() {
+        let key = [0x42u8; 16];
+        // Non-power-of-2 domain (like real usage).
+        let domain = 100;
+        let r = 44;
+        let prp = HoangPrp::new(domain, r, &key);
+
+        // Sequential: forward() one at a time.
+        let sequential: Vec<usize> = (0..domain).map(|x| prp.forward(x)).collect();
+
+        // 4-way: shuffle_forward_4way in chunks.
+        let mut four_way = vec![0usize; domain];
+        for ci in 0..(domain + 3) / 4 {
+            let base = ci * 4;
+            let xs = [
+                base,
+                (base + 1).min(domain - 1),
+                (base + 2).min(domain - 1),
+                (base + 3).min(domain - 1),
+            ];
+            let ys = prp.shuffle_forward_4way(xs);
+            for (i, &y) in (base..(base + 4).min(domain)).zip(ys.iter()) {
+                four_way[i] = y;
+            }
+        }
+
+        assert_eq!(sequential, four_way, "4-way must match sequential forward()");
+    }
+
+    #[test]
+    fn test_4way_large_domain() {
+        // Test with a domain size close to real Bitcoin index bucket.
+        let key = [0xAB; 16];
+        let domain = 10007; // prime, non-power-of-2
+        let r = 56;
+        let prp = HoangPrp::new(domain, r, &key);
+
+        let sequential: Vec<usize> = (0..domain).map(|x| prp.forward(x)).collect();
+
+        let mut four_way = vec![0usize; domain];
+        for ci in 0..(domain + 3) / 4 {
+            let base = ci * 4;
+            let xs = [
+                base,
+                (base + 1).min(domain - 1),
+                (base + 2).min(domain - 1),
+                (base + 3).min(domain - 1),
+            ];
+            let ys = prp.shuffle_forward_4way(xs);
+            for (i, &y) in (base..(base + 4).min(domain)).zip(ys.iter()) {
+                four_way[i] = y;
+            }
+        }
+
+        assert_eq!(sequential, four_way, "4-way must match sequential at domain={}", domain);
     }
 }
