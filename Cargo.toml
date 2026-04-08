@@ -19,8 +19,8 @@ num-bigint = "0.4"
 rayon = { version = "1.10", optional = true }
 
 # Optional PRP backends
-fastprp = { path = "../fastprp", optional = true }
-alf-nt = { path = "../ALF", optional = true }
+fastprp = { git = "https://github.com/Bitcoin-PIR/fastprp.git", rev = "eaf1ee787c051c1250329cbe645c157e085af6e2", optional = true }
+alf-nt = { git = "https://github.com/Bitcoin-PIR/ALF.git", rev = "e2e0b3d6a231f2a3491d07a4facbf69d4e5ae607", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 bincode = { version = "1", optional = true }
 
