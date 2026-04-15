@@ -23,7 +23,7 @@ Note: `alf` requires `../ALF` and `fastprp-prp` requires `../fastprp` as sibling
 
 ```rust
 // src/prp/mod.rs
-pub trait Prp {
+pub trait Prp: Send + Sync {
     fn forward(&self, x: usize) -> usize;   // Encrypt: P_k(x)
     fn inverse(&self, y: usize) -> usize;   // Decrypt: P_k^{-1}(y)
     fn domain(&self) -> usize;              // Domain size [0, N')
@@ -34,7 +34,9 @@ pub trait BatchPrp: Prp {
 }
 ```
 
-The protocol accepts `Box<dyn Prp>`. All three backends implement both traits.
+The protocol accepts `Box<dyn Prp>`. All four backends implement both traits.
+Trait objects are `Send + Sync`, so `Box<dyn Prp>` can be held across `.await`
+points and shared across threads without extra bounds.
 
 ## Creating PRP Instances
 
@@ -60,7 +62,6 @@ let prp_group_1 = engine.create_prp_for_group(1);
 - Domain must be >= 65536 (ALF bit_width >= 16)
 - Native: ~198 ns/op. WASM: ~10.8 us/op (software AES fallback).
 - Two internal AlfNt instances (one encrypt, one decrypt).
-- `Send + Sync` — safe to share across threads.
 
 ### FastPRP (recommended for server-side batch generation)
 

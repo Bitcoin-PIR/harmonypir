@@ -45,12 +45,6 @@ pub struct AlfPrp {
     data_bytes: usize,
 }
 
-// SAFETY: AlfNt's encrypt/decrypt take &self and only mutate the caller-provided
-// buffer. After construction (engine_init + key_init + tweak_init + prepare_decrypt),
-// the internal SIMD state is read-only. No shared mutable state.
-unsafe impl Send for AlfPrp {}
-unsafe impl Sync for AlfPrp {}
-
 impl AlfPrp {
     /// Create a new ALF PRP.
     ///

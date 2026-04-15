@@ -32,7 +32,7 @@ pub mod hoang;
 ///
 /// Both `forward` and `inverse` must be deterministic for a given key.
 /// `forward(inverse(x)) == x` and `inverse(forward(x)) == x` for all x in [domain].
-pub trait Prp {
+pub trait Prp: Send + Sync {
     /// Evaluate the permutation: P_k(x).
     fn forward(&self, x: usize) -> usize;
 
