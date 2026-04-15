@@ -25,6 +25,7 @@ dependencies = [
 [[package]]
 name = "alf-nt"
 version = "0.1.0"
+source = "git+https://github.com/Bitcoin-PIR/ALF.git?rev=e2e0b3d6a231f2a3491d07a4facbf69d4e5ae607#e2e0b3d6a231f2a3491d07a4facbf69d4e5ae607"
 
 [[package]]
 name = "anes"
@@ -237,6 +238,7 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 [[package]]
 name = "fastprp"
 version = "0.1.0"
+source = "git+https://github.com/Bitcoin-PIR/fastprp.git?rev=eaf1ee787c051c1250329cbe645c157e085af6e2#eaf1ee787c051c1250329cbe645c157e085af6e2"
 dependencies = [
  "aes",
 ]
