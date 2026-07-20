@@ -2,6 +2,7 @@
 name = "harmonypir"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.78"
 description = "Independent implementation of HarmonyPIR: Efficient Single-Server Stateful PIR"
 
 [features]
